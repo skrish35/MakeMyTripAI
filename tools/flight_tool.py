@@ -26,6 +26,7 @@ COUNTRY_ALIASES = {
     "u.s.": "US",
     "america": "US",
     "united states": "US",
+    "india": "IN",
     "uk": "GB",
     "u.k.": "GB",
     "britain": "GB",
@@ -37,7 +38,6 @@ COUNTRY_ALIASES = {
     "russia": "RU",
     "vietnam": "VN",
     "bangladesh": "BD",
-    "india": "IN",
     "japan": "JP",
     "china": "CN",
     "singapore": "SG",
@@ -509,6 +509,6 @@ def search_flights(query: str, limit: int = 10):
     return f"{route_info}\n\n" + "\n\n---\n\n".join(formatted_flights)
 
 if __name__ == "__main__":
-    print(search_flights("Plan a 7 days Japan trip from New york"))
+    print(search_flights("Plan a 7 days Japan trip from New"))
     print("\n" + "=" * 80 + "\n")
     print(search_flights("all country flight info"))
