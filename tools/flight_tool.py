@@ -91,7 +91,7 @@ CITY_MAIN_AIRPORT = {
     "chennai": "MAA",
     "bangalore": "BLR",
     "bengaluru": "BLR",
-    "tokyo": "NRT",
+    "tokyo": "HND",
     "osaka": "KIX",
     "kyoto": "KIX",
     "new york": "JFK",
@@ -110,6 +110,15 @@ CITY_MAIN_AIRPORT = {
     "frankfurt": "FRA",
 }
 
+CITY_ALTERNATE_AIRPORTS = {
+    "HND": ["NRT"],
+    "NRT": ["HND"],
+    "JFK": ["EWR", "LGA"],
+    "EWR": ["JFK", "LGA"],
+    "LHR": ["LGW", "STN"],
+    "CDG": ["ORY"],
+}
+
 def clean_text(text: str) -> str:
     text = text.lower().strip()
     text = re.sub(r"[^a-z0-9\s]", " ", text)
@@ -117,7 +126,8 @@ def clean_text(text: str) -> str:
     stop_words = [
         "flight", "flights", "ticket", "tickets", "trip", "travel",
         "plan", "complete", "days", "day", "including", "hotel",
-        "hotels", "sightseeing", "under", "budget", "info", "information"
+        "hotels", "sightseeing", "under", "budget", "info", "information",
+        "and", "back", "return"
     ]
     words = [w for w in text.split() if w not in stop_words]
     return " ".join(words).strip()
@@ -336,7 +346,7 @@ def parse_route(query: str):
 
     # Pattern: from X to Y
     match = re.search(
-        r"\bfrom\s+(.+?)\s+\bto\s+(.+?)(?:\s+(?:on|for|under|including|with|in|at)\b|[.!?]|$)",
+        r"\bfrom\s+(.+?)\s+\bto\s+(.+?)(?:\s+(?:on|for|under|including|with|in|at|and|back|return)\b|[.!?]|$)",
         q_lower,
     )
 
@@ -351,7 +361,7 @@ def parse_route(query: str):
 
     # Pattern: to Y from X
     match = re.search(
-        r"\bto\s+(.+?)\s+\bfrom\s+(.+?)(?:\s+(?:on|for|under|including|with|in|at)\b|[.!?]|$)",
+        r"\bto\s+(.+?)\s+\bfrom\s+(.+?)(?:\s+(?:on|for|under|including|with|in|at|and|back|return)\b|[.!?]|$)",
         q_lower,
     )
 
@@ -478,6 +488,38 @@ def search_flights(query: str, limit: int = 10):
         )
 
     flight_data = data.get("data", [])
+
+    # Automatic fallback to alternate airports if primary route returns no results
+    if not flight_data and (dep_iata or arr_iata):
+        alt_arrs = CITY_ALTERNATE_AIRPORTS.get(arr_iata, []) if arr_iata else []
+        alt_deps = CITY_ALTERNATE_AIRPORTS.get(dep_iata, []) if dep_iata else []
+
+        for alt_arr in alt_arrs:
+            alt_params = dict(params)
+            alt_params["arr_iata"] = alt_arr
+            try:
+                r = requests.get(BASE_URL, params=alt_params, timeout=15)
+                d = r.json()
+                if d.get("data"):
+                    flight_data = d.get("data")
+                    arr_iata = alt_arr
+                    break
+            except Exception:
+                pass
+
+        if not flight_data:
+            for alt_dep in alt_deps:
+                alt_params = dict(params)
+                alt_params["dep_iata"] = alt_dep
+                try:
+                    r = requests.get(BASE_URL, params=alt_params, timeout=15)
+                    d = r.json()
+                    if d.get("data"):
+                        flight_data = d.get("data")
+                        dep_iata = alt_dep
+                        break
+                except Exception:
+                    pass
 
     if not flight_data:
         route_text = ""
