@@ -1,17 +1,19 @@
-import requests
-import os
 from mcp.server.fastmcp import FastMCP
+import requests
+import os 
 from dotenv import load_dotenv
 
 load_dotenv()
 
-mcp = FastMCP("Weather MCP server")
+mcp = FastMCP("Weather MCP Server")
+
 
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 
+
 @mcp.tool()
 def get_current_weather(city: str):
-    """Get the current weather for a given city using the OpenWeatherMap API."""
+
     response = requests.get(
         "https://api.openweathermap.org/data/2.5/weather",
         params={
@@ -35,9 +37,11 @@ def get_current_weather(city: str):
         "wind_speed": data["wind"]["speed"]
     }
 
+
+
 @mcp.tool()
 def get_forecast(city: str):
-    """Get the weather forecast for a given city using the OpenWeatherMap API."""
+
     url = (
         "https://api.openweathermap.org/data/2.5/forecast"
     )
