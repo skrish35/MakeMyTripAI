@@ -117,6 +117,7 @@ function hideApproval() {
 }
 
 async function sendMessage() {
+console.log("SENDMESSAGE V2 RUNNING", Date.now());
   hideError();
 
   if (waitingForApproval) {
@@ -193,9 +194,7 @@ async function submitApproval(approved) {
   try {
     const response = await fetch("/api/travel/approve", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         thread_id: currentThreadId,
         approved: approved,
@@ -210,8 +209,16 @@ async function submitApproval(approved) {
     }
 
     showWorkflow(data);
-    hideApproval();
-    showResult(data.answer, data.thread_id, false);
+
+    if (data.requires_approval) {
+      // Revised draft is ready — show it and re-open approval for another round.
+      feedbackInput.value = "";
+      showResult(data.itinerary || data.answer, data.thread_id, true);
+      showApproval(data);
+    } else {
+      hideApproval();
+      showResult(data.answer, data.thread_id, false);
+    }
   } catch (error) {
     showError(error.message);
   } finally {
@@ -255,8 +262,15 @@ function downloadPDF() {
   downloadBtn.textContent = "Preparing PDF...";
   downloadBtn.disabled = true;
 
+  // Reset scroll position first — html2canvas captures relative to the
+  // current window scroll, and the page auto-scrolls to the result
+  // section after generation, which otherwise shows up as blank space
+  // at the top of the PDF.
+  const previousScrollY = window.scrollY;
+  window.scrollTo(0, 0);
+
   const options = {
-    margin: 0.5,
+    margin: 0.4,
     filename: "ai-travel-plan.pdf",
     image: {
       type: "jpeg",
@@ -265,7 +279,9 @@ function downloadPDF() {
     html2canvas: {
       scale: 2,
       useCORS: true,
-      backgroundColor: "#ffffff"
+      backgroundColor: "#ffffff",
+      scrollX: 0,
+      scrollY: 0
     },
     jsPDF: {
       unit: "in",
@@ -273,7 +289,8 @@ function downloadPDF() {
       orientation: "portrait"
     },
     pagebreak: {
-      mode: ["avoid-all", "css", "legacy"]
+      mode: ["css"],
+      avoid: ["tr", "th", "td", "h1", "h2", "h3", "li", "img"]
     }
   };
 
@@ -284,10 +301,12 @@ function downloadPDF() {
     .then(() => {
       downloadBtn.textContent = oldText;
       downloadBtn.disabled = false;
+      window.scrollTo(0, previousScrollY);
     })
     .catch(() => {
       downloadBtn.textContent = oldText;
       downloadBtn.disabled = false;
+      window.scrollTo(0, previousScrollY);
       showError("Could not download PDF.");
     });
 }

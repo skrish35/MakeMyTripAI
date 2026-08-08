@@ -7,11 +7,13 @@ os.environ["SSL_CERT_FILE"] = certifi.where()
 os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
 
 from typing import Any, TypedDict, Annotated
+from pydantic import BaseModel, Field
 import operator
 import uuid
 import asyncio
 import json
 import psycopg
+import re
 from psycopg.rows import dict_row
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.postgres import PostgresSaver
@@ -59,7 +61,7 @@ if not GROQ_API_KEY:
 # LLM - original model kept
 # =========================
 llm = ChatGroq(
-    model="openai/gpt-oss-20b",
+    model="openai/gpt-oss-safeguard-20b",
     api_key=GROQ_API_KEY,
 )
 
@@ -123,15 +125,42 @@ def _llm_text(system_prompt: str, user_prompt: str) -> str:
     return str(response.content)
 
 
-def _json_from_llm(text: str) -> dict[str, Any]:
-    """Extract the first complete JSON object returned by the model."""
-    start = text.find("{")
-    end = text.rfind("}")
+class GuardrailDecision(BaseModel):
+    allowed: bool = True
+    reason: str = ""
 
-    if start == -1 or end == -1 or end < start:
+
+class SupervisorDecision(BaseModel):
+    selected_agents: list[str] = Field(default_factory=list)
+    trip_constraints: dict[str, Any] = Field(default_factory=dict)
+    reasoning: str = ""
+
+
+def _json_from_llm(text: str) -> dict[str, Any]:
+    """Parse JSON even when the model wraps it in Markdown fences/text."""
+    text = str(text).strip()
+
+    # Remove common Markdown JSON fences.
+    text = re.sub(r"^```(?:json)?\\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\\s*```$", "", text).strip()
+
+    start = text.find("{")
+    if start == -1:
         raise ValueError("The model did not return a JSON object.")
 
-    return json.loads(text[start : end + 1])
+    # Decode the first complete JSON object rather than using rfind('}').
+    decoder = json.JSONDecoder()
+    parsed, _ = decoder.raw_decode(text[start:])
+
+    if not isinstance(parsed, dict):
+        raise ValueError("The model returned JSON, but it was not an object.")
+
+    return parsed
+
+
+def _structured_llm(schema):
+    """Return a structured-output LLM when supported by the installed LangChain/Groq version."""
+    return llm.with_structured_output(schema)
 
 
 def _empty_constraints() -> dict[str, Any]:
@@ -174,14 +203,22 @@ User request:
     # Fail open on parser/model errors so a temporary JSON-format issue does not
     # break the original travel-planning behavior.
     try:
-        guardrail_raw = _llm_text(
-            "You are the input guardrail for a travel-planning application. "
-            "Return strict JSON only.",
-            guardrail_prompt,
-        )
-        guardrail_result = _json_from_llm(guardrail_raw)
-        allowed = bool(guardrail_result.get("allowed", True))
-        guardrail_reason = str(guardrail_result.get("reason", "")).strip()
+        try:
+            guardrail_model = _structured_llm(GuardrailDecision)
+            guardrail_result = guardrail_model.invoke(guardrail_prompt)
+            allowed = bool(guardrail_result.allowed)
+            guardrail_reason = str(guardrail_result.reason).strip()
+        except Exception:
+            # Compatibility fallback for older Groq/LangChain versions.
+            guardrail_raw = _llm_text(
+                "You are the input guardrail for a travel-planning application. "
+                "Return strict JSON only.",
+                guardrail_prompt,
+            )
+            parsed_guardrail = _json_from_llm(guardrail_raw)
+            allowed = bool(parsed_guardrail.get("allowed", True))
+            guardrail_reason = str(parsed_guardrail.get("reason", "")).strip()
+
         llm_calls += 1
     except Exception as exc:
         print(f"Guardrail fallback used: {exc}")
@@ -235,12 +272,31 @@ User request:
 """
 
     try:
-        supervisor_raw = _llm_text(
-            "You route work to travel specialist agents. Return strict JSON only.",
-            supervisor_prompt,
-        )
-        parsed = _json_from_llm(supervisor_raw)
-        requested_agents = parsed.get("selected_agents", [])
+        try:
+            supervisor_model = _structured_llm(SupervisorDecision)
+            decision = supervisor_model.invoke(supervisor_prompt)
+
+            requested_agents = decision.selected_agents
+            parsed_constraints = decision.trip_constraints
+            reasoning = str(decision.reasoning).strip()
+
+        except Exception as structured_exc:
+            print(
+                f"Supervisor structured-output failed; using JSON fallback: "
+                f"{type(structured_exc).__name__}: {structured_exc}",
+                flush=True,
+            )
+
+            supervisor_raw = _llm_text(
+                "You route work to travel specialist agents. Return strict JSON only.",
+                supervisor_prompt,
+            )
+            parsed = _json_from_llm(supervisor_raw)
+
+            requested_agents = parsed.get("selected_agents", [])
+            parsed_constraints = parsed.get("trip_constraints", {})
+            reasoning = str(parsed.get("reasoning", "")).strip()
+
         selected_agents = [
             name for name in AGENT_ORDER
             if name in requested_agents and name in KNOWN_AGENTS
@@ -251,12 +307,17 @@ User request:
             selected_agents.append("itinerary_agent")
 
         constraints = _empty_constraints()
-        parsed_constraints = parsed.get("trip_constraints", {})
         if isinstance(parsed_constraints, dict):
             constraints.update(parsed_constraints)
 
-        reasoning = str(parsed.get("reasoning", "")).strip()
         llm_calls += 1
+
+        print("\n========== SUPERVISOR DECISION ==========", flush=True)
+        print(f"USER QUERY: {query}", flush=True)
+        print(f"SELECTED AGENTS: {selected_agents}", flush=True)
+        print(f"TRIP CONSTRAINTS: {constraints}", flush=True)
+        print(f"REASONING: {reasoning}", flush=True)
+        print("==========================================\n", flush=True)
     except Exception as exc:
         print(f"Supervisor fallback used: {exc}")
         # Original workflow behavior is preserved as the fallback.
@@ -498,6 +559,9 @@ User Query:
 Trip Constraints:
 {state.get('trip_constraints', {})}
 
+Human Revision Feedback:
+{state.get('human_feedback', '') or 'No previous human revision requested.'}
+
 Flight Results:
 {state.get('flight_results', '')}
 
@@ -538,7 +602,11 @@ Create a clear draft that is ready for human review.
 # Human-in-the-Loop approval
 # =========================
 def human_approval_agent(state: TravelState):
-    # Do not wrap interrupt() in try/except. LangGraph uses it to pause execution.
+    # IMPORTANT: do not catch interrupt(). LangGraph uses it to pause execution.
+    print("\n========== HITL PAUSE ==========", flush=True)
+    print("Waiting for human approval/revision.", flush=True)
+    print("=================================\n", flush=True)
+
     review = interrupt(
         {
             "question": "Do you approve this itinerary?",
@@ -553,8 +621,19 @@ def human_approval_agent(state: TravelState):
         }
     )
 
+    if not isinstance(review, dict):
+        raise ValueError(
+            "HITL resume payload must be an object containing "
+            "'approved' and optional 'feedback'."
+        )
+
     approved = bool(review.get("approved", False))
     human_feedback = str(review.get("feedback", "")).strip()
+
+    print("\n========== HITL RESPONSE ==========", flush=True)
+    print(f"APPROVED: {approved}", flush=True)
+    print(f"FEEDBACK: {human_feedback}", flush=True)
+    print("====================================\n", flush=True)
 
     return {
         "approved": approved,
@@ -677,6 +756,18 @@ def route_after_agent(current_agent: str):
     return route
 
 
+def route_after_human_approval(state: TravelState) -> str:
+    """
+    Approved -> final response.
+    Rejected -> regenerate the itinerary using human feedback, then pause
+    for HITL approval again.
+    """
+    if state.get("approved", False):
+        return "final_agent"
+
+    return "itinerary_agent"
+
+
 # =========================
 # Build Graph
 # =========================
@@ -708,7 +799,14 @@ graph.add_conditional_edges(
     "budget_agent", route_after_agent("budget_agent"), ROUTE_MAP
 )
 graph.add_edge("itinerary_agent", "human_approval")
-graph.add_edge("human_approval", "final_agent")
+graph.add_conditional_edges(
+    "human_approval",
+    route_after_human_approval,
+    {
+        "final_agent": "final_agent",
+        "itinerary_agent": "itinerary_agent",
+    },
+)
 graph.add_edge("final_agent", END)
 graph.add_edge("guardrail_blocked", END)
 
@@ -750,6 +848,10 @@ def _serialize_result(
     interrupt_payload = _interrupt_payload(result)
 
     if interrupt_payload:
+        print(
+            "SERIALIZE: LangGraph returned an active HITL interrupt.",
+            flush=True,
+        )
         answer = interrupt_payload.get("draft_itinerary") or result.get(
             "itinerary", ""
         )
@@ -826,6 +928,13 @@ def resume_travel_agent(
         raise ValueError("thread_id is required to resume a travel plan.")
 
     config = {"configurable": {"thread_id": thread_id}}
+
+    print("\n========== HITL RESUME ==========", flush=True)
+    print(f"THREAD ID: {thread_id}", flush=True)
+    print(f"APPROVED: {approved}", flush=True)
+    print(f"FEEDBACK: {feedback.strip()}", flush=True)
+    print("==================================\n", flush=True)
+
     result = travel_graph.invoke(
         Command(
             resume={
@@ -836,4 +945,13 @@ def resume_travel_agent(
         config=config,
     )
 
-    return _serialize_result(result, thread_id)
+    serialized = _serialize_result(result, thread_id)
+
+    print(
+        f"HITL RESUME COMPLETE: requires_approval="
+        f"{serialized.get('requires_approval')}, "
+        f"approved={serialized.get('approved')}",
+        flush=True,
+    )
+
+    return serialized
